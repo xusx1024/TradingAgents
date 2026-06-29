@@ -7,11 +7,12 @@ import pandas as pd
 SavePathType = Annotated[str, "File path to save data. If None, data is not saved."]
 
 # Tickers can contain letters, digits, dot, dash, underscore, caret
-# (index symbols like ^GSPC), equals (futures like GC=F), and plus
-# (forex/CFD symbols like XAUUSD+). None of these enable directory
-# traversal, so the value never escapes a containing directory when
-# interpolated into a path. Anything else is rejected.
-_TICKER_PATH_RE = re.compile(r"^[A-Za-z0-9._\-\^=+]+$")
+# (index symbols like ^GSPC), equals (futures like GC=F), plus
+# (forex/CFD symbols like XAUUSD+), and Unicode word characters
+# (Chinese stock names, etc.). None of these enable directory traversal,
+# so the value never escapes a containing directory when interpolated
+# into a path. Characters like / and \ are still rejected.
+_TICKER_PATH_RE = re.compile(r"^[\w.\-\^=+]+$", re.UNICODE)
 
 
 def safe_ticker_component(value: str, *, max_len: int = 32) -> str:
