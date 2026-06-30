@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import time
 from typing import Annotated
 
@@ -11,6 +12,9 @@ from yfinance.exceptions import YFRateLimitError
 from .config import get_config
 from .symbol_utils import NoMarketDataError, normalize_symbol
 from .utils import safe_ticker_component
+
+# A-share ticker patterns: 600378, 000001, 600378.SS, 000001.SZ, etc.
+_A_SHARE_RE = re.compile(r"^\d{6}(\.(SS|SZ|BJ))?$", re.IGNORECASE)
 
 logger = logging.getLogger(__name__)
 
@@ -174,11 +178,36 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
         downloaded = _ensure_date_column(downloaded.reset_index())
         # Only cache real data — never persist an empty frame.
         if downloaded.empty or "Close" not in downloaded.columns:
-            raise NoMarketDataError(
-                symbol, canonical, "Yahoo Finance returned no rows"
-            )
-        downloaded.to_csv(data_file, index=False, encoding="utf-8")
-        data = downloaded
+            # Yahoo Finance has poor A-share coverage; fall back to akshare when
+            # the ticker looks like a Chinese stock (600378, 000001.SZ, etc.).
+            if _A_SHARE_RE.match(str(symbol).strip()):
+                try:
+                    from .akshare_vendor import load_ohlcv_akshare
+
+                    ak_data = load_ohlcv_akshare(
+                        symbol, curr_date, cache_dir=config["data_cache_dir"]
+                    )
+                    if ak_data is not None and not ak_data.empty:
+                        data = ak_data
+                        logger.info("Fetched %s via akshare (yfinance returned no rows)", symbol)
+                    else:
+                        raise NoMarketDataError(
+                            symbol, canonical, "Yahoo Finance returned no rows and akshare also failed"
+                        )
+                except ImportError:
+                    logger.warning(
+                        "akshare not installed; install with: pip install akshare"
+                    )
+                    raise NoMarketDataError(
+                        symbol, canonical, "Yahoo Finance returned no rows (install akshare for A-share support)"
+                    )
+            else:
+                raise NoMarketDataError(
+                    symbol, canonical, "Yahoo Finance returned no rows"
+                )
+        else:
+            downloaded.to_csv(data_file, index=False, encoding="utf-8")
+            data = downloaded
 
     data = _clean_dataframe(data)
 

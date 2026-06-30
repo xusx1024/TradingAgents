@@ -128,6 +128,16 @@ def normalize_symbol(raw: str) -> str:
     else:
         canonical = s
 
+    # Reject Chinese stock names and other non-ASCII input before it reaches
+    # yfinance / HTTP, where it would cause an ``UnicodeEncodeError``.
+    if not canonical.isascii():
+        raise ValueError(
+            f"'{raw}' looks like a stock name, not a ticker symbol. "
+            f"Please use the numeric ticker instead (e.g. '600378' for 昊华科技, "
+            f"'000001.SZ' for 平安银行). A-share tickers: 上交所 → xxxxxx.SS, "
+            f"深交所 → xxxxxx.SZ."
+        )
+
     if canonical != raw.strip().upper():
         logger.info("Resolved symbol %r to Yahoo symbol %r", raw, canonical)
     return canonical
