@@ -1,12 +1,14 @@
-"""A-share data vendor via akshare.
+"""A-share data vendor — multi-source with fallback chain.
 
-Yahoo Finance has poor coverage for Chinese A-shares (SSE/SZSE).
-akshare is the fallback provider for tickers ending in ``.SS`` / ``.SZ``
-and for 6-digit numeric tickers without a suffix.
+Yahoo Finance has poor coverage for Chinese A-shares. This module provides
+A-share OHLCV via three independent sources, tried in order:
 
-OHLCV data is fetched via :func:`akshare.stock_zh_a_hist` and returned in
-the same schema as the yfinance path (Date, Open, High, Low, Close, Volume),
-so downstream consumers (stockstats, market_data_validator) work unchanged.
+  1. Tencent  (``web.ifzq.gtimg.cn``) — fastest, most reliable, 日线
+  2. akshare  (东方财富)                — richer data but unstable
+  3. Sina     (placeholder for future)
+
+All return the same DataFrame schema (Date, Open, High, Low, Close, Volume)
+so downstream consumers work unchanged.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import time
 from datetime import datetime
 
 import pandas as pd
+import requests
 
 from .utils import safe_ticker_component
 
@@ -46,6 +49,56 @@ def _to_akshare_symbol(symbol: str) -> str:
         if upper.endswith(suffix):
             return upper[: -len(suffix)]
     return upper
+
+
+def _load_ohlcv_tencent(
+    clean_symbol: str,
+    curr_dt: pd.Timestamp,
+    cache_file: str | None,
+    symbol: str,
+) -> pd.DataFrame | None:
+    """Tencent 日线 API——A 股首选数据源，独立于东方财富。"""
+    exchange = "sz" if clean_symbol.startswith(("0", "3")) else "sh"
+    param = f"{exchange}{clean_symbol},day,,,320,qfq"
+    url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={param}"
+
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+            klines = (
+                data.get("data", {}).get(f"{exchange}{clean_symbol}", {}).get("qfqday")
+                or data.get("data", {}).get(f"{exchange}{clean_symbol}", {}).get("day")
+            )
+            if not klines:
+                return None
+
+            # Tencent format: [date, open, close, high, low, volume]
+            rows = []
+            for k in klines:
+                rows.append({
+                    "Date": pd.to_datetime(k[0]),
+                    "Open": float(k[1]),
+                    "Close": float(k[2]),
+                    "High": float(k[3]),
+                    "Low": float(k[4]),
+                    "Volume": float(k[5]),
+                })
+            df = pd.DataFrame(rows)
+            df = df[df["Date"] <= curr_dt]
+            df = df.dropna(subset=["Close"])
+            if df.empty:
+                return None
+
+            if cache_file:
+                df.to_csv(cache_file, index=False, encoding="utf-8")
+
+            logger.info("Fetched %s via Tencent", symbol)
+            return df
+        except Exception:
+            time.sleep(1 * (attempt + 1))
+
+    return None
 
 
 def load_ohlcv_akshare(
@@ -88,67 +141,47 @@ def load_ohlcv_akshare(
                 if not cached.empty:
                     return cached
 
+    # --- Source 1: Tencent (fastest, most stable, independent of 东方财富) ---
+    df = _load_ohlcv_tencent(clean_symbol, curr_dt, cache_file, symbol)
+    if df is not None:
+        return df
+
+    # --- Source 2: akshare / 东方财富 ---
     import akshare as ak
 
-    max_retries = 3
-    last_exc = None
-    for attempt in range(max_retries):
+    for attempt in range(3):
         try:
             df = ak.stock_zh_a_hist(
-                symbol=clean_symbol,
-                period="daily",
-                start_date=start_str,
-                end_date=end_str,
-                adjust="qfq",  # 前复权
+                symbol=clean_symbol, period="daily",
+                start_date=start_str, end_date=end_str, adjust="qfq",
             )
-            break
-        except Exception as exc:
-            last_exc = exc
-            if attempt < max_retries - 1:
-                delay = 2 * (attempt + 1)
-                logger.warning(
-                    "akshare fetch failed for %r (attempt %d/%d), retrying in %ds: %s",
-                    symbol, attempt + 1, max_retries, delay, exc,
-                )
-                time.sleep(delay)
+            if df is not None and not df.empty:
+                break
+            df = None
+        except Exception:
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
     else:
-        logger.warning("akshare fetch failed for %r after %d attempts: %s", symbol, max_retries, last_exc)
+        logger.warning("All A-share sources failed for %r", symbol)
         return None
 
     if df is None or df.empty:
         return None
 
-    # Normalise column names to match yfinance → stockstats convention.
+    # Normalise columns to yfinance convention.
     col_map = {
-        "日期": "Date",
-        "开盘": "Open",
-        "最高": "High",
-        "最低": "Low",
-        "收盘": "Close",
-        "成交量": "Volume",
+        "日期": "Date", "开盘": "Open", "最高": "High",
+        "最低": "Low", "收盘": "Close", "成交量": "Volume",
     }
     df = df.rename(columns=col_map)
-
-    # Ensure required columns exist.
-    required = ["Date", "Open", "High", "Low", "Close", "Volume"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        logger.warning("akshare returned incomplete columns for %r: missing %s", symbol, missing)
-        return None
-
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.dropna(subset=["Date"])
-    df = df[df["Date"] <= curr_dt]
-    df = df.sort_values("Date")
+    df = df[df["Date"] <= curr_dt].sort_values("Date")
 
-    if df.empty:
-        return None
-
-    # Cache for reuse.
-    if cache_file:
+    if not df.empty and cache_file:
         df.to_csv(cache_file, index=False, encoding="utf-8")
 
-    return df
+    return df if not df.empty else None
 
 
 def get_akshare_stock_data(

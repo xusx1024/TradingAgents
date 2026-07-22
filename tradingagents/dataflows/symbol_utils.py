@@ -127,6 +127,17 @@ def normalize_symbol(raw: str) -> str:
         canonical = f"{s}=X"
     else:
         canonical = s
+        # A-share 6-digit tickers: add exchange suffix so yfinance can resolve them.
+        # 00xxxx / 30xxxx → Shenzhen (.SZ)
+        # 60xxxx         → Shanghai (.SS)
+        # 8xxxxx / 4xxxxx / 92xxxx → Beijing (.BJ)
+        if canonical.isascii() and canonical.isdigit() and len(canonical) == 6:
+            if canonical.startswith(("0", "3")):
+                canonical = f"{canonical}.SZ"
+            elif canonical.startswith("6"):
+                canonical = f"{canonical}.SS"
+            elif canonical.startswith(("8", "4", "92")):
+                canonical = f"{canonical}.BJ"
 
     # Reject Chinese stock names and other non-ASCII input before it reaches
     # yfinance / HTTP, where it would cause an ``UnicodeEncodeError``.

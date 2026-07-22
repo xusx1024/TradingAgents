@@ -47,7 +47,8 @@ import requests
 # 配置
 # ---------------------------------------------------------------------------
 
-THRESHOLD = 868.0  # 告警阈值（元/克）
+THRESHOLD = 868.0       # 告警阈值（元/克）
+RECOVERY_MARGIN = 2.0   # 恢复缓冲区：价格需回到 threshold + margin 以上才解除告警
 INTERVAL = 60  # 轮询间隔（秒）
 WEBHOOK_URL = (
     "https://qyapi.weixin.qq.com/cgi-bin/webhook/send"
@@ -75,9 +76,10 @@ def _fetch_impl() -> tuple[float | None, str]:
     au = df[df["品种"] == "Au99.99"]
     if au.empty:
         return None, "未找到 Au99.99 品种"
-    row = au.iloc[0]
-    price = float(row["现价"])
-    update_time = str(row.get("更新时间", "未知"))
+    # 取最后 N 笔均价平滑，避免逐笔 tick 抖动导致频繁穿越阈值
+    window = min(20, len(au))
+    price = float(au["现价"].iloc[-window:].mean())
+    update_time = str(au["更新时间"].iloc[-1])
     return price, update_time
 
 
@@ -170,11 +172,13 @@ def run(threshold: float = THRESHOLD, interval: int = INTERVAL):
                 hi = max(window_prices)
                 lo = min(window_prices)
                 avg = sum(window_prices) / len(window_prices)
+                alert_tag = ""
+                if price < threshold:
+                    alert_tag = " ⚠️低于阈值!" + ("🔔" if alert_fired else "")
                 print(
                     f"[{_now()}] Au99.99={price:.2f} {trend}{delta:+.2f} | "
                     f"高:{hi:.2f} 低:{lo:.2f} 均:{avg:.2f} | "
-                    f"样本:{len(window_prices)} "
-                    f"{'⚠️低于阈值!' if price < threshold else ''}"
+                    f"样本:{len(window_prices)}{alert_tag}"
                 )
             window_prices.clear()
             last_log_time = datetime.now()
@@ -189,21 +193,24 @@ def run(threshold: float = THRESHOLD, interval: int = INTERVAL):
             )
             ok = send_webhook(msg)
             if ok:
-                print(f"  → 告警已推送")
                 alert_fired = True
+                print(f"[{_now()}] 🔔 跌破告警已推送！Au99.99={price:.2f} < {threshold:.2f}")
             else:
-                print(f"  → 告警推送失败")
+                print(f"[{_now()}] ⚠️ 告警推送失败，下轮重试")
 
-        # 价格回到阈值以上 → 重置告警状态，下次再跌破会重新推送
-        if price >= threshold and alert_fired:
+        # 价格回到阈值+缓冲区以上 → 重置告警状态，下次再跌破会重新推送
+        if price >= threshold + RECOVERY_MARGIN and alert_fired:
             msg = (
                 f"✅ 黄金回升至阈值以上\n"
                 f"Au99.99: {price:.2f} 元/克\n"
                 f"时间: {_now()}"
             )
-            send_webhook(msg)
-            alert_fired = False
-            print(f"  → 恢复通知已推送")
+            ok = send_webhook(msg)
+            if ok:
+                alert_fired = False
+                print(f"[{_now()}] ✅ 回升通知已推送！Au99.99={price:.2f} >= {threshold:.2f}")
+            else:
+                print(f"[{_now()}] ⚠️ 回升通知推送失败")
 
         time.sleep(interval)
 

@@ -160,6 +160,14 @@ def build_instrument_context(
             "Do not substitute a different company or ticker unless a tool "
             "result explicitly disproves this resolved identity."
         )
+    else:
+        context += (
+            " WARNING: Could not resolve the company identity for this ticker. "
+            "You MUST NOT guess or fabricate a company name. Use only the ticker "
+            "symbol `{ticker}` in all reports and analysis. "
+            "If you do not know the company name, say \"identity not confirmed for "
+            "{ticker}\" — do NOT invent one."
+        ).format(ticker=ticker)
 
     if is_crypto:
         context += (
